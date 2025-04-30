@@ -522,12 +522,8 @@ let mk_action_binding
 (* Type type of atomic probe actions *)
 noeq
 type atomic_probe_action : Type0 -> Type u#1 =
-  // | Atomic_probe_init:
-  //     init_cb:PA.init_probe_dest_t ->
-  //     sz:U64.t ->
-  //     atomic_probe_action unit false
   | Atomic_probe_and_copy :
-      bytes_to_read : U64.t { bytes_to_read <> 0uL }->
+      bytes_to_read : U64.t ->
       probe_fn: PA.probe_fn_incremental ->
       atomic_probe_action unit
   | Atomic_probe_and_read :
@@ -587,16 +583,14 @@ type probe_action : bool -> Type u#1 =
   | Probe_action_var :
       probe_m unit true false ->
       probe_action false
-  | Probe_action_simple:
-      bytes_to_read : U64.t ->
-      probe_fn: PA.probe_fn ->
-      probe_action true
   | Probe_action_seq:
+      detail:string ->
       m1: probe_action false ->
       m2: probe_action false ->
       probe_action false
   | Probe_action_let:
       #t:Type0 ->
+      detail:string ->
       m1: atomic_probe_action t ->
       m2: (t -> probe_action false) ->
       probe_action false
@@ -618,13 +612,11 @@ let rec probe_action_as_probe_m #maybe_zero (p:probe_action maybe_zero)
     atomic_probe_action_as_probe_m a
   | Probe_action_var m ->
     m
-  | Probe_action_simple bytes_to_read probe_fn ->
-    PA.probe_fn_as_probe_m bytes_to_read probe_fn
-  | Probe_action_seq m1 m2 ->
-    PA.seq_probe_m () (probe_action_as_probe_m m1) (probe_action_as_probe_m m2)
-  | Probe_action_let m1 m2 ->
+  | Probe_action_seq detail m1 m2 ->
+    PA.seq_probe_m detail () (probe_action_as_probe_m m1) (probe_action_as_probe_m m2)
+  | Probe_action_let detail m1 m2 ->
     let k x : PA.probe_m unit _ _ = probe_action_as_probe_m (m2 x) in
-    PA.bind_probe_m () (atomic_probe_action_as_probe_m m1) k
+    PA.bind_probe_m detail () (atomic_probe_action_as_probe_m m1) k
   | Probe_action_ite cond m1 m2 ->
     PA.if_then_else cond (probe_action_as_probe_m m1) (probe_action_as_probe_m m2)
   | Probe_action_array len body ->
