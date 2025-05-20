@@ -114,7 +114,7 @@ let parse_check_and_desugar (en:env) (mname:string) (fn:string)
   
   let decls = TypeSizes.size_of_decls benv en.typesizes_env decls in
 
-  Options.debug_print_string "=============Finished typesizes pass=============\n";
+  Options.debug_print_string "=============After typesizes pass=============\n";
 
   let decls = CoerceProbes.replace_stubs benv decls in
 
@@ -147,7 +147,7 @@ let parse_check_and_desugar (en:env) (mname:string) (fn:string)
   Options.debug_print_string "=============After refining records =============\n";
 
   let static_asserts = StaticAssertions.compute_static_asserts benv en.typesizes_env refinement in
-  Options.debug_print_string "=============Finished static asserts pass=============\n";
+  Options.debug_print_string "=============After static asserts pass=============\n";
 
   let en = {
     en with 
@@ -710,6 +710,7 @@ let go () : ML unit =
       (Options.get_emit_output_types_defs ())
       (Options.get_skip_o_rules ())
       (Options.get_clang_format ())
+      (not (Options.get_clang_format_use_custom_config ()))
       cmd_line_files
   | None ->
   (* Special mode: --__produce_c_from_existing_krml *)
@@ -782,6 +783,7 @@ let go () : ML unit =
         (Options.get_add_include ())
         (Options.get_clang_format ())
         (Options.get_clang_format_executable ())
+        (not (Options.get_clang_format_use_custom_config ()))
         (Options.get_skip_c_makefiles ())
         (Options.get_cleanup ())
         (Options.get_no_everparse_h ())

@@ -131,19 +131,9 @@ let atomic_field_has_simple_probe_aux (e:env) head_type (f:atomic_field)
 = match f.v.field_probe with
   | Some fp -> (
     match has_simple_probe fp with
-    | Some l -> (
-        match l.v with
-        | App (Cast _ _) [{ v = App SizeOf [{v=Identifier x}]}]
-        | App SizeOf [{v=Identifier x}] ->
-          if eq_idents x head_type
-          then true, None
-          else (
-            false, Some x
-          )
-        | _ -> false, None
-      )
+    | Some l -> true, Some head_type
     | _ ->
-      FStar.IO.print_string <|
+      Options.debug_print_string <|
         Printf.sprintf "Expected a simple probe, got %s\n"
           (print_probe_call fp);
       false, None
@@ -164,30 +154,32 @@ let rec needs_probe_field (maybe_gen:bool) (enclosing_type:typedef_names) (e:env
   match f.v with
   | AtomicField f ->
     let head_type, _ = head_type e f.v.field_type in
-    let has_simple_probe, field_type_ident = atomic_field_has_simple_probe_aux e head_type f in
+    let has_simple_probe = atomic_field_has_simple_probe e head_type f in
     if has_simple_probe
-    then (let e, changed = mark_for_probe e head_type  in
-          let e, changed' = maybe_generalize e enclosing_type in
-          e, changed || changed')
+    then (
+      let e, changed = mark_for_probe e head_type  in
+      let e, changed' = maybe_generalize e enclosing_type in
+      e, changed || changed'
+    )
     else (
-      match field_type_ident with
-      | Some x ->
-        error 
-          (Printf.sprintf 
-            "Expected a probe with sizeof(%s) but found a probe with sizeof(%s)"
-            (print_ident head_type)
-            (print_ident x))
-          f.range
-      | None -> 
-        let e, changed = 
-          if should_generate_probe e enclosing_type
-          then mark_for_probe e head_type // struct A { B b; } should probe B if A is probed
-          else e, false
-        in
-        if should_generalize_ident e head_type 
-        then let e, changed' = maybe_generalize e enclosing_type in // struct A { B <...> b; } should generalize A if B is generalized
-              e, changed || changed'
-        else e, changed
+      // match field_type_ident with
+      // | Some x ->
+      //   error 
+      //     (Printf.sprintf 
+      //       "Expected a probe with sizeof(%s) but found a probe with sizeof(%s)"
+      //       (print_ident head_type)
+      //       (print_ident x))
+      //     f.range
+      // | None -> 
+      let e, changed = 
+        if should_generate_probe e enclosing_type
+        then mark_for_probe e head_type // struct A { B b; } should probe B if A is probed
+        else e, false
+      in
+      if should_generalize_ident e head_type 
+      then let e, changed' = maybe_generalize e enclosing_type in // struct A { B <...> b; } should generalize A if B is generalized
+            e, changed || changed'
+      else e, changed
     )
   | RecordField r _ ->
     fold_left_changed (needs_probe_field maybe_gen enclosing_type) e r
@@ -203,11 +195,22 @@ and needs_probe_case (maybe_generalize:bool) (enclosing_type:typedef_names) (e:e
 let need_probe_decl (e:env) (d:decl) 
 : ML (env & bool)
 = let maybe_generalize = not (is_entrypoint d) in
+  let should_descend n : ML bool =
+    should_generalize_ident e n.typedef_abbrev `_or_`
+    should_generate_probe e n
+  in
   match d.d_decl.v with
   | Record names _ _ _ fields ->
-    fold_left_changed (needs_probe_field maybe_generalize names) e fields
+    if should_descend names
+    then fold_left_changed (needs_probe_field maybe_generalize names) e fields
+   else e, false
   | CaseType names _ _ sw ->
-    fold_left_changed (needs_probe_case maybe_generalize names) e (snd sw)
+    if should_descend names
+    then fold_left_changed (needs_probe_case maybe_generalize names) e (snd sw)
+    else e, false
+  | Specialize _ t _ -> (
+    mark_for_generalize e t
+  )
   | _ -> e, false
 
 let rec need_probe_decls (e:env) (ds:list decl)
@@ -242,7 +245,7 @@ let rec generic_instantiations_for_type (e:B.env) (tt:typ)
     args, mk_arrow_ps params probe_m_t
   | _ -> failwith "Impossible: field type is an arrow"
 
-let generate_probe_functions (e:env) (d:decl)
+let generate_probe_function_stubs (e:env) (d:decl)
 : ML (list decl)
 = let simple_probe (names:_{should_generate_probe e names}) params
     : ML decl
@@ -262,9 +265,13 @@ let generate_probe_functions (e:env) (d:decl)
       in
       let params = List.Tot.filter (should_retain_param_for_probe e.benv) params in
       let d' = 
-        mk_decl 
-          (ProbeFunction simple_probe_name params simple_probe 
-            (SimpleProbeFunction names.typedef_abbrev))
+        mk_decl         
+        //  (ProbeFunction simple_probe_name params simple_probe 
+        //     (SimpleProbeFunction names.typedef_abbrev))
+          (CoerceProbeFunctionStub 
+            (Ast.name32 simple_probe_name)
+            params
+            (CoerceProbeFunctionPlaceholder names.typedef_abbrev))
           dummy_range
           []
           false
@@ -405,26 +412,63 @@ and generalize_probe_cases (e:env) (path_prefix:string) (cs:list case)
        f::fs, gs'@gs, is'@is)
     cs ([], [], [])
 
-let default_instantiation (e:env) (r:range) (head_type:ident)
-: ML expr 
-= match simple_probe_name_for_type e head_type with
+let default_instantiation_subst
+      (e:env)
+      (r:range)
+      (enclosing_type:typedef_names)
+      (gs:list generic_param)
+      (sig:generalized_signature)
+: ML (list decl & subst)
+= match GlobalEnv.extern_probe_fn_qual (B.global_env_of_env e.benv) PQWithOffsets with
   | None ->
-    failwith (Printf.sprintf "Could not find probe instantiation for %s\n"
-                (print_ident head_type))
-  | Some probe_inst ->
-    with_range (Identifier probe_inst) r
-
-let default_instantiation_subst (e:env) (r:range) (gs:list generic_param) (sig:generalized_signature)
-: ML subst
-= let insts = 
-    List.map2 
-      (fun (GenericProbeFunction id _ _) (s, _) -> id, default_instantiation e r s)
-      gs sig
-  in
-  Options.debug_print_string
-    (Printf.sprintf "Instantiations: %s\n"
-      (String.concat "; " <| List.map (fun (i, e) -> Printf.sprintf "%s -> %s" (print_ident i) (print_expr e)) insts));
-  mk_subst insts
+    failwith "No extern probe function found"
+  | Some probe_and_copy_n ->
+    let default_instantiation_body = 
+      with_range (Probe_action_copy_init_sz probe_and_copy_n) r
+    in
+    let default_name_for param_name type_name =
+      let name =
+        Printf.sprintf "%s_%s_%s" 
+          enclosing_type.typedef_abbrev.v.name
+          param_name.v.name
+          type_name.v.name in
+      { param_name with v = { param_name.v with name } }
+    in
+    let formals_of_type (t:typ) : ML (list param) =
+      match t.v with
+      | Type_arrow args _ ->
+        List.mapi (fun i t -> 
+          let name = Printf.sprintf "%s_arg%d" reserved_prefix i in
+          t, mk_ident name, Immutable) args
+      | _ -> []
+    in
+    let default_instatiation_for (g:generic_param)
+    : ML (decl & (ident & expr)) 
+    = let GenericProbeFunction param_name typ type_name = g in
+      let name = default_name_for param_name type_name in
+      let params = formals_of_type typ in
+      let decl = 
+        mk_decl
+          (ProbeFunction
+            name
+            params
+            default_instantiation_body (SimpleProbeFunction type_name))
+          dummy_range
+          []
+          false
+      in
+      decl, (param_name, with_range (Identifier name) r)
+    in
+    let decls, subst =
+      List.map (fun g -> default_instatiation_for g) gs
+      |> List.unzip
+    in
+    Options.debug_print_string <|
+      (Printf.sprintf
+        "Generated substitution: {%s}\n"
+          (String.concat "; "
+            (List.map (fun (i, e) -> Printf.sprintf "[%s -> %s]" (print_ident i) (print_expr e)) subst)));
+    decls, mk_subst subst
 
 let generalize_probes_decl (e:env) (d:decl)
 : ML (list decl)
@@ -441,26 +485,16 @@ let generalize_probes_decl (e:env) (d:decl)
         gen_name with 
         typedef_attributes = gen_name.typedef_attributes
     } in
-    // let instantiated_type =
-    //   let head = gen_name.typedef_abbrev in
-    //   let insts = List.map (default_instantiation e d.d_decl.range) sig in
-    //   let instantiations =
-    //     insts @
-    //     List.map
-    //       (function GenericProbeFunction i _ ->
-    //         with_range (Identifier i) i.range)
-    //       gs
-    //   in
-    //   let params =
-    //     List.map (fun (_, i, _) -> Inl <| with_range (Identifier i) i.range) params
-    //   in
-    //   with_range (Type_app head KindSpec instantiations params)
-    //               d.d_decl.range
-    // in
-    // let inst_attrs = List.filter (fun a -> not (Aligned? a)) names.typedef_attributes in
     gen_name
-    // , instantiated_type, inst_attrs
   in
+  let id_of_decl d =
+    match idents_of_decl d with
+    | [i] -> i
+    | _::j::_ -> j
+  in
+  Options.debug_print_string
+    (Printf.sprintf "Generalize_probe_decls for %s\n"
+      (print_ident <| id_of_decl d));
   match d.d_decl.v with
   | Record names gs params w fields -> (
     let fields, gs', sig = generalize_probe_fields e "" fields in
@@ -468,16 +502,22 @@ let generalize_probes_decl (e:env) (d:decl)
     | [] -> [d]
     | _ -> (
       Options.debug_print_string
-        (Printf.sprintf "**************************Instantiations with signature %s for fields: %s\n"
+        (Printf.sprintf "**************************For type %s\nInstantiations with signature %s for fields: %s\n"
+              (print_ident names.typedef_abbrev)
               (print_generics gs')
               (String.concat "; " <| List.map print_field fields));
       if not <| should_generalize e names
       then (
-        let s = default_instantiation_subst e d.d_decl.range gs' sig in
+        let ds, s = default_instantiation_subst e d.d_decl.range names gs' sig in
         let fields = List.map (subst_field s) fields in
-        [ { d with 
-            d_decl = { d.d_decl with 
-            v=Record names gs params w fields }} ]
+        let d = { d with 
+                d_decl = { d.d_decl with 
+                v=Record names gs params w fields }} in
+        Options.debug_print_string
+          (Printf.sprintf
+            "<After substitution>:\n%s\n</After substitution>"
+            (print_decl d));
+        ds@[ d ]
       )
       else (
         let gen_name = generalize_type names gs params sig in
@@ -495,13 +535,23 @@ let generalize_probes_decl (e:env) (d:decl)
     match gs' with
     | [] -> [d]
     | _ -> (
+      Options.debug_print_string
+        (Printf.sprintf "**************************For type %s\nInstantiations with signature %s for fields: %s\n"
+              (print_ident names.typedef_abbrev)
+              (print_generics gs')
+              (String.concat "; " <| List.map print_case cases));
       if not <| should_generalize e names
       then (
-        let s = default_instantiation_subst e d.d_decl.range gs' sig in
+        let ds, s = default_instantiation_subst e d.d_decl.range names gs' sig in
         let cases' = List.map (subst_case s) cases in
-        [ { d with 
+        let d = { d with 
             d_decl = { d.d_decl with 
-            v=CaseType names gs params (v, cases') }} ]
+            v=CaseType names gs params (v, cases') }} in
+        Options.debug_print_string
+          (Printf.sprintf
+            "<After substitution>:\n%s\n</After substitution>"
+            (print_decl d));
+        ds@[ d ]
       )
       else (
         let gen_name = generalize_type names gs params sig in
@@ -521,9 +571,24 @@ let generalize_probe_decls (e:GlobalEnv.global_env) (ds:list decl)
 = let e = { benv = Binding.mk_env e; needs_probe = []; should_generalize = H.create 10 } in
   let e = need_probe_decls e ds in
   let print_ident (i:ident') = i.name in
+  let _ = 
+    List.iter
+      (fun d ->
+        match d.d_decl.v with
+        | Specialize _ t _ ->
+          if None? (H.try_find e.should_generalize t.v)
+          then error (Printf.sprintf "Type %s was marked for specialization, but nothing was found to be specialized"        
+                              (print_ident t.v))
+                      d.d_decl.range
+        | _ -> ())
+        ds
+  in
   Options.debug_print_string
     (Printf.sprintf "Probes needed for: %s\nShould generalize: %s\n" 
       (String.concat ", " (List.map print_ident e.needs_probe))
       (String.concat ", " (H.fold (fun k _ out -> print_ident k::out) e.should_generalize [])));
-  let ds = List.collect (generate_probe_functions e) ds in
+  let ds = List.collect (generate_probe_function_stubs e) ds in
+  Options.debug_print_string "=============After generate probe functions=============\n";
+  Options.debug_print_string (print_decls ds);
+  Options.debug_print_string "\n";
   List.collect (generalize_probes_decl e) ds
